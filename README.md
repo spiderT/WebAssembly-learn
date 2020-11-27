@@ -334,9 +334,431 @@ varuintN（N = 1 / 7 / 32）
 varintN（N = 7 / 32 / 64）  
 该类型与上述的 varuintN 类似，只不过表示的是使用 Signed LEB-128 编码，具有 N 个 bit 长度的可变长有符号整数。N 的可取值为 7、32 或 64，对应各类型的取值范围为 [-2^(N-1), +2^(N-1)-1]。同样地，当在使用一个较大类型（比如 N 取 64）保存较小的整数值时，经过 Signed LEB-128 编码后的二进制序列中，可能会存在用于占位的字节 “0x80” 或 “0xff”。
 
+## 3. WAT
 
+这样一段 C/C++ 源代码, 将它编译成对应的 WAT 代码。
 
+```c++
+int factorial(int n) {
+  if (n == 0) {
+    return 1;
+  } else {
+    return n * factorial(n-1);
+  } 
+}
+```
 
+经过编译和转换后，该函数对应的 WAT 文本代码如下所示。
+
+```text
+
+(func $factorial (; 0 ;) (param $0 i32) (result i32)
+ (local $1 i32)
+ (local $2 i32)
+ (block $label$0
+  (br_if $label$0
+   (i32.eqz
+    (get_local $0)
+   )
+  )
+  (set_local $2
+   (i32.const 1)
+  )
+  (loop $label$1
+   (set_local $2
+    (i32.mul
+     (get_local $0)
+     (get_local $2)
+    )
+   )
+   (set_local $0
+    (tee_local $1
+     (i32.add
+      (get_local $0)
+      (i32.const -1)
+     )
+    )
+   )
+   (br_if $label$1
+    (get_local $1)
+   )
+  )
+  (return
+   (get_local $2)
+  )
+ )
+ (i32.const 1)
+)
+```
+
+WAT 的全称 “WebAssembly Text Format”，我们一般称其为 “WebAssembly 可读文本格式”。它是一种与 Wasm 字节码格式完全等价，可用于编码 Wasm 模块及其相关定义的文本格式。这种格式使用 “S- 表达式” 的形式来表达 Wasm 模块及其定义，将组成模块各部分的字节码用一种更加线性的、可读的方式进行表达。  
+
+这种文本格式可以被 Wasm 相关的编译工具直接使用，比如 WAVM 虚拟机、Binaryen 调试工具等。不仅如此，Web 浏览器还会在 Wasm 模块没有与之对应的 source-map 数据时（即无法显示模块对应的源语言代码，比如 C/C++ 代码），使用对应的 WAT 可读文本格式代码来作为代替，以方便开发者进行调试。  
+
+### 3.1. S- 表达式（S-Expression）
+
+“S-Expression”，或者简写为 “sexpr”，它是一种用于表达树形结构化数据的记号方式。  
+
+```s
+(print
+ (* 2 (+ 3 4))
+)
+```
+
+一对小括号 “()” 来定义每一个表达式的结构。  
+
+在上面的 Lisp 代码中，子表达式 “(* 2 (+ 3 4))” 的值直接作为了 print 函数的输入参数。而对于这个子表达式本身，也通过内部嵌套的括号表达式及运算符，规定了求值的具体顺序和规则。  
+
+每一个表达式在求值时，都会将该表达式将要执行的“操作”，作为括号结构的第一个元素，而对应该操作的具体操作“内容”则紧跟其后。  
+
+因为 “S- 表达式” 可以被应用于多种不同的场景中，所以这里的操作可能是指一个函数、一个 V-ISA 中的指令，甚至是标识一个结构的标识符。而所对应的“内容”也可以是不同类型的元素或结构。  
+
+对一个 “S- 表达式” 的求值会从最内层的括号表达式开始。比如对于上述的 Lisp 代码，我们会首先计算其最内层表达式 “(+ 3 4)” 的值。计算完毕后，该括号表达式的位置会由该表达式的计算结果进行替换。以此类推，从内到外，最后计算出整个表达式的值。当然，除了求值，对于诸如 print 函数来说，也会产生一些如“与操作系统 IO 进行交互”之类的副作用（Side Effect）。  
+
+![wasm](images/wasm18.png)
+
+### 3.2. 源码、字节码与 Flat-WAT
+
+从源代码、Wasm 字节码再到 WAT 三者之间的对应关系，首先我们要做的第一件事就是将对应的 WAT 代码 “拍平（flatten）”  
+
+在通过 “S- 表达式” 形式表达的 WAT 代码中，我们通过“嵌套”与“小括号”的方式指定了各个表达式的求值顺序。而 “拍平” 的过程就是将这些嵌套以及括号结构去掉，以“从上到下”的先后顺序，来表达整个程序的执行流程。  
+
+被“拍平”之后，我们可以得到如下所示的 Flat-WAT 代码（这里我们只列出函数体所对应的部分）。  
+
+```text
+
+(func $factorial (param $0 i32) (result i32)
+ block $label$0
+  local.get $0
+  i32.eqz
+  br_if $label$0
+  local.get $0
+  i32.const 255
+  i32.add
+  i32.const 255
+  i32.and
+  call $factorial
+  local.get $0
+  i32.mul
+  i32.const 255
+  i32.and
+  return
+ end
+ i32.const 1)
+```
+
+![wasm](images/wasm19.png)
+
+### 3.3. 模块结构与 WAT
+
+WAT 还可以描述与 Wasm 模块定义相关的其他部分，比如模块中各个 Section 的具体结构。如下所示，这是用于构成一个完整 Wasm 模块定义的其他字节码组成部分，所对应的 WAT 可读文本代码。
+
+```text
+(module
+ (table 0 anyfunc)
+ (memory $0 1)
+ (export "memory" (memory $0))
+ (export "factorial" (func $factorial))
+ ...
+)
+```
+
+带有 “table” 关键字的子表达式，定义了 Table Section 的结构。其中的 “0” 表示该 Section 的初始大小为 0，随后紧跟的 “anyfunc” 表示该 Section 可以容纳的元素类型为函数指针类型。其他的诸如 “memory” 表达式定义了 Memory Section，“export” 表达式定义了 Export Section，以此类推。  
+
+### 3.4. WAT 与 WAST
+
+以 “.wast” 为后缀的文本文件通常表示着 “.wat” 的一个超集。也就是说，在该文件中可能会包含有一些，基于 WAT 可读文本格式代码标准扩展而来的其他语法结构。比如一些与“断言”和“测试”有关的代码，而这部分语法结构并不属于 Wasm 标准的一部分。  
+
+相反的，以 “.wat” 为后缀结尾的文本文件，通常只能够包含有 Wasm 标准语法所对应的 WAT 可读文本代码。并且在一个文本文件中，我们也只能够定义单一的 Wasm 模块结构。  
+
+在日常的 Wasm 学习、开发和调试过程中，我更推荐你使用 “.wat” 这个后缀，来作为包含有 WAT 代码的文本文件扩展名。这样可以保障该文件能够具有足够高的兼容性，能够适配大多数的编译工具，甚至是浏览器来进行识别和解析。
+
+### 3.5. WAT 相关工具
+
+WABT（The WebAssembly Binary Toolkit）的 Wasm 工具集。安装方法：https://github.com/WebAssembly/wabt#building-using-cmake-directly-linux-and-macos  
+
+- wasm2wat：该工具主要用于将指定文件内的 Wasm 二进制代码转译为对应的 WAT 可读文本代码。
+- wat2wasm：该工具的作用恰好与 wasm2wat  相反。它可以将输入文件内的 WAT 可读文本代码转译为对应的 Wasm 二进制代码。
+- wat-desugar：该工具主要用于将输入文件内的，基于 “S- 表达式” 形式表达的 WAT 可读文本代码“拍平”成对应的 Flat-WAT 代码。
+
+“.wast” 与 “.wat” 两种文本文件格式之间的区别。其中，前者为后者的超集，其内部可能会含有与“测试”和“断言”相关的扩展性语法结构；而后者仅包含有与 Wasm 标准相关的可读文本代码结构。因此，在日常编写 WAT 的过程中，建议你以 “.wat” 作为保存 WAT 代码的文本文件后缀。  
+
+## 4. WebAssembly 操作系统接口
+
+鉴于 Wasm 所拥有“可移植”、“安全”及“高效”等特性，Wasm 也被逐渐应用在 Web 领域之外的一些其他场景中。将 Wasm 应用到 out-of-web 环境中的一项新的标准 —— WASI（WebAssembly System Interface，Wasm 操作系统接口）。通过这项标准，Wasm 将可以直接与操作系统打交道。  
+
+### 4.1. 基于能力的安全 Capability-based Security
+
+Capability-based Security 是一种已知的、常用的安全模型。通常来讲，在计算机领域中，我们所提及的 capability 可以指代如 Token、令牌等概念。capability 是一种用于表示某种权限的标记，它可以在用户之间进行传递且无法被伪造。在一个使用了 Capability-based Security 安全模型的操作系统中，任何用户对计算机资源的访问，都需要通过一个具体的 capability 来进行。  
+
+Capability-based Security 同时也指代了一种规范用户程序的原则。比如这些用户程序可以根据“最小特权原则”（该原则要求计算环境中的各个模块仅能够访问当下所必需的信息或资源）来彼此直接共享 capability，这样可以使得操作系统仅分配用户程序需要使用的权限，并且可以做到“一次分配，多次使用”。  
+
+Capability-based Security 这个安全模型，通常会跟另外的一种基于“分级保护域”方式实现的安全模型形成对比。基于“分级保护域”实现的安全模型，被广泛应用于类 Unix 的各类操作系统中，比如下图所示的操作系统 Ring0 层和 Ring3 层（Ring1 / Ring2 一般不会被使用）便是“分级保护域”的一种具体实现形式。  
+
+![wasm](images/wasm20.png)
+
+Ring0 层拥有着最高权限，一般用于内核模式；而 Ring3 层的权限则会被稍加限制，一般用于运行用户程序。当一个运行在 Ring3 层的用户程序，试图去调用只有 Ring0 层进程才有权限使用的指令时，操作系统会阻止调用。这就是“分级保护域”的大致概念。  
+
+Capability-based Security，capability 通过替换在分级保护域中使用的“引用”，来达到提升系统安全性的目的。这里的“引用”是指用于访问资源的一类“定位符”，比如用于访问某个文件资源的“文件路径字符串”便是一个引用。  
+
+引用本身并没有指定实际对应资源的权限信息，以及哪些用户程序可以拥有这个引用。因此，每一次尝试通过该引用来访问实际资源的操作，都会经由操作系统来进行基于“分级保护域”的权限验证。比如验证发起访问的用户是否有权限持有该资源，这种方式便十分适合早期计算机系统的“多用户”特征（每个用户有不同的权限）。  
+
+在具有 capability 概念的操作系统中，只要用户程序拥有了这个 capability，那它就拥有足够的权限去访问对应的资源。从理论上来讲，基于 Capability-based Security 的操作系统，甚至不需要如“权限控制列表（ACL）”这类的传统权限控制机制。  
+
+用户程序只能够通过 capability 暴露出的特定“入口”，来访问对应的系统资源。我们可以用操作系统中常见的一个概念 —— “文件描述符（File Descriptor）”来类比 capability 的概念。如下图所示。  
+
+![wasm](images/wasm21.png)
+
+可以将文件描述符类比为 capability。举个例子，当应用程序在通过 C 标准库中的 “fopen” 函数去打开一个文件时，函数会返回一个非负整数，来表示一个特定文件资源对应的文件描述符。在拥有了这个描述符后，应用程序便可以按照在调用 “fopen” 函数时所指定的操作（比如 “w”），来相应地对这个文件资源进行处理。当函数返回负整数时，则表示无法获得该资源。在这些返回的错误代码中，就包含有与“权限不足”相关的调用错误信息。  
+
+拥有某个 capability 的用户程序，可以“任意地”处理这个 capability。比如，可以访问其对应的系统资源、可以将其传递给其他的应用程序来进行使用，或者也可以选择直接将这个 capability 删除。操作系统有义务确保某个特定的 capability 只能够对应系统中的某个特定的资源或操作，以保证安全策略的完备性。  
+
+### 4.2. 系统调用（System Call）
+
+fopen 函数是 C 标准库中定义的一个函数，那么我们就从某个特定的 C 标准库实现所对应的源代码入手，来看看 fopen 函数的具体实现细节。这里我们以 musl 这个 libc 的实现为例。在它的源代码中，我们可以找到如下这段对 fopen 函数的定义代码（这里只列出了关键的部分）。  
+
+```c++
+FILE *fopen(const char *restrict filename, const char *restrict mode) {
+  ...
+  /* Compute the flags to pass to open() */
+  flags = __fmodeflags(mode);
+
+  fd = sys_open(filename, flags, 0666);
+  if (fd < 0) return 0;
+  ...
+}
+```
+
+musl 调用了一个名为 “sys_open” 的函数 —— “系统调用”。  
+
+sys_open 函数其实是对系统调用进行了封装，在函数内部会使用内联的汇编代码，去实际调用某个具体的“系统调用”。这里 sys_open 对应的，便是指“用于打开本地文件资源”的那个系统调用。  
+
+每一个系统调用，都对应着需要与操作系统打交道的某个特定功能，并且有着唯一的“系统调用 ID” 与之相对应。在不同的操作系统中，对应同一系统调用的系统调用 ID 可能会发生变化。  
+
+而 C/C++ 标准库的作用，便是为我们提供了一个统一、稳定的编程接口。让我们的程序可以做到“一次编写，到处编译”。从某种程度上来讲，标准库的出现为应用程序源代码提供了“可移植性”。比如让我们不再需要随着操作系统类型的变化，而硬编码不同的系统调用 ID。  
+
+标准库还会帮助我们处理系统调用前后需要做的一些事情，比如简化函数参数的传递、对各种异常情况进行处理，以及“关闭文件”之类的“善后”工作。关于用户应用程序与操作系统调用之间的关系，可以参考这幅图。
+
+![wasm](images/wasm22.png)
+
+### 4.3. WebAssembly 操作系统接口（WASI）
+
+WASI 在 Wasm 字节码与虚拟机之间，增加了一层“系统调用抽象层”。比如对于在 C/C++ 源码中使用的 fopen 函数，当我们将这部分源代码与专为 WASI 实现的 C 标准库 “wasi-libc” 进行编译时，源码中对 fopen 的函数调用过程，其内部会间接通过调用名为 “__wasi_path_open” 的函数来实现。这个 __wasi_path_open 函数，便是对实际系统调用的一个抽象。  
+
+__wasi_path_open 函数的具体实现细节会交由各个虚拟机自行处理。也就是说，虚拟机需要在其 Runtime 运行时环境中提供，对 Wasm 模块字节码所使用到的 __wasi_path_open 函数的解析和执行能力的支持。而虚拟机在实际实现这些系统调用抽象层接口时，也需要通过实际的系统调用来进行。只不过这些细节上的处理，对于 Wasm 二进制模块来讲，是完全透明的。  
+
+将上述提到的 wasi-libc、Wasm 二进制模块、WASI 系统调用抽象层，以及虚拟机基础设施之间的关系，通过下图来直观地展示。  
+
+![wasm](images/wasm23.png)
+
+实际上，类似 __wasi_path_open 的这类以 “__wasi” 开头的，用于抽象实际系统调用的函数，便是 WASI 的核心组成部分。WASI 根据不同系统调用所提供的不同功能，将这些系统调用对应的 WASI 抽象函数接口，分别划分到了不同的子集合中。  
+
+一个名为 “wasi-core” 的 WASI 标准子集合，包含有对应于“文件操作”与“网络操作”等相关系统调用的 WASI 抽象函数接口。其他如 “crypto”、“multimedia” 等子集合，甚至可以包含与实际系统调用无关的一系列 WASI 抽象系统调用接口。你可以理解为 WASI 所描述的抽象系统调用，是针对 Wasm V-ISA 描述的抽象机器而言。针对这部分抽象系统的具体实现，则会依赖一部分实际的系统调用。  
+
+![wasm](images/wasm24.png)
+
+WASI 在设计和实现时，需要遵守 Wasm 的“可移植性”及“安全性”这两个基本原则。
+
+#### 4.3.1. 可移植性
+
+WASI 通过在 Wasm 二进制字节码与虚拟机基础设施之间，提供统一的“系统调用抽象层”来保证 Wasm 模块的可移植性。这样一来，上层的 Wasm 模块可以不用考虑平台相关的调用细节，统一将对实际系统调用的调用过程，转换为对“抽象系统调用”的调用过程。  
+
+而“抽象系统调用”的实现细节，则由下层的相关基础设施来负责处理。基础设施会根据其所在操作系统类型的不同，将对应的抽象系统调用映射到真实的系统调用上。当然，并不是所有的抽象系统调用都需要被映射到真实的系统调用上，因为对于某些抽象系统调用而言，基础设施只是负责提供相应的实现即可。
+
+一个经过编译生成的 Wasm 二进制模块便可以在浏览器之外也同样保证其可移植性。真正做到“一次编译，到处运行”，“抽象”便是解决这个问题的关键。  
+
+#### 4.3.2. 安全性
+
+实际上，基础设施在真正实现 WASI 标准时，便会采用 “Capability-based Security” 的方式来控制每一个 Wasm 模块实例所拥有的 capability。  
+
+假设一个 Wasm 模块想要打开一个计算机本地文件，而且这个模块还是由使用了 fopen 函数的 C/C++ 源代码编译而来，那对应的虚拟机在实例化该 Wasm 模块时，便会将 fopen 对应的 WASI 系统调用抽象函数 “__wasi_path_open” 以某种方式（比如通过包装后的函数指针），当做一个 capability 从模块的 Import Section 传递给该模块进行使用。  
+
+通过这种方式，基础设施掌握了主动权。它可以决定是否要将某个 capability 提供给 Wasm 模块进行使用。若某个 Wasm 模块偷偷使用了一些不为开发者知情的系统调用，那么当该模块在虚拟机中进行实例化时，便会露出马脚。掌握这样的主动权，正适合如今我们基于众多不知来源的第三方库进行代码开发的现状。  
+
+对于没有经过基础设施授权的 capability 调用过程，将会被基础设施拦截。通过相应的日志系统进行收集，这些“隐藏的小伎俩”便会在第一时间被开发者 / 用户感知，并进行相应的处理。  
+
+## 5. WebAssembly MVP 标准
+
+“嵌入接口标准”，定义了有关 Wasm 在 Web 平台上，在与浏览器进行交互时所需要使用的相关 Web 接口以及 JavaScript 接口。
+
+![wasm](images/wasm30.png)
+
+### 5.1. Wasm 浏览器加载流程
+
+一个 Wasm 二进制模块需要经过怎样的流程，才能够最终在 Web 浏览器中被使用。  
+
+![wasm](images/wasm25.png)
+
+1. 首先是 “Fetch” 阶段。作为一个客户端 Web 应用，在这个阶段中，我们需要将被使用到的 Wasm 二进制模块，从网络上的某个位置通过 HTTP 请求的方式，加载到浏览器中。Wasm 二进制模块的加载过程，同我们日常开发的 Web 应用在浏览器中加载 JavaScript 脚本文件等静态资源的过程，没有任何区别。对于 Wasm 模块，你也可以选择将它放置到 CDN 中，或者经由 Service Worker 缓存，以加速资源的下载和后续使用过程。  
+
+2. 接下来是 “Compile” 阶段。在这个阶段中，浏览器会将从远程位置获取到的 Wasm 模块二进制代码，编译为可执行的平台相关代码和数据结构。这些代码可以通过 “postMessage()” 方法，在各个 Worker 线程中进行分发，以让 Worker 线程来使用这些模块，进而防止主线程被阻塞。此时，浏览器引擎只是将 Wasm 的字节码编译为平台相关的代码，而这些代码还并没有开始执行。  
+
+3. “Instantiate” 阶段。在这个阶段中，浏览器引擎开始执行在上一步中生成的代码。Wasm 模块可以通过定义 “Import Section” 来使用外界宿主环境中的一些资源。在这一阶段中，浏览器引擎在执行 Wasm 模块对应的代码时，会将那些 Wasm 模块规定需要从外界宿主环境中导入的资源，导入到正在实例化中的模块，以完成最后的实例化过程。这一阶段完成后，我们便可以得到一个动态的、保存有状态信息的 Wasm 模块实例对象。
+
+4. “Call”。在这一步中，直接通过上一阶段生成的动态 Wasm 模块对象，来调用从 Wasm 模块内导出的方法。
+
+### 5.2. Wasm JavaScript API
+
+#### 5.2.1. 模块对象
+
+Wasm 在 JavaScript API 标准中为我们提供了如下两个对象与之分别对应：
+
+- WebAssembly.Module
+- WebAssembly.Instance
+
+这两个 JavaScript 对象本身也可以被作为类型构造函数使用，以用来直接构造对应类型的对象。也就是说，我们可以通过 “new” 的方式并传入相关参数，来构造这些类型的某个具体对象。比如，可以按照以下方式来生成一个 WebAssembly.Module 对象：
+
+```js
+// "..." 为有效的 Wasm 字节码数据；
+bufferSource = new Int8Array([...]);  
+let module = new WebAssembly.Module(bufferSource);
+```
+
+WebAssembly.Module 构造函数接受一个包含有效 Wasm 二进制字节码的 ArrayBuffer 或者 TypedArray 对象。  
+
+WebAssembly.Instance 构造函数的用法与 WebAssembly.Module 类似，只不过是构造函数的参数有所区别. 具体查看 https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/WebAssembly。  
+
+#### 5.2.2. 导入对象
+
+Web 浏览器作为 Wasm 模块运行时的一个宿主环境，通过 JavaScript 的形式提供了可以被导入到 Wasm 模块中使用的数据类型，这些数据类型包括函数（Function）、全局数据（Global）、线性内存对象（Memory）以及 Table 对象（Table）。其中除“函数”类型外，其他数据类型分别对应着以下由 JavaScript 对象表示的包装类型：  
+
+- WebAssembly.Global  
+- WebAssembly.Memory  
+- WebAssembly.Table  
+
+对于函数类型，我们可以直接使用 JavaScript 语言中的“函数”来作为代替。  
+
+可以通过“直接构造”的方式来创建上述这些 JavaScript 对象。以 “WebAssembly.Memory” 为例，我们可以通过如下方式，来创建一个 WebAssembly.Memory 对象：
+
+```js
+let memory = new WebAssembly.Memory({
+  initial:10,
+  maximum:100,
+});
+```
+
+通过为构造函数传递参数的方式，指定了所生成 WebAssembly.Memory 对象的一些属性。比如该对象所表示的 Wasm 线性内存其初始大小为 10 页，其最大可分配大小为 100 页。  
+
+Wasm 线性内存的大小必须是 “Wasm 页” 大小的整数倍，而一个 “Wasm 页” 的大小在 MVP 标准中被定义为了 “64KiB”（注意和 64 KB 的区别。KiB 为 1024 字节，而 KB 为 1000 字节）。  
+
+WebAssembly.Global 与 WebAssembly.Table 可以参考 https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/WebAssembly  
+
+#### 5.2.3. 错误对象
+
+表示在整个 Wasm 加载、编译、实例化及函数执行流程中，在其各个阶段中所发生的错误。这些错误对象分别是：  
+
+- WebAssembly.CompileError 表示在 Wasm 模块编译阶段（Compile）发生的错误，比如模块的字节码编码格式错误、魔数不匹配
+- WebAssembly.LinkError 表示在 Wasm 模块实例化阶段（Instantiate）发生的错误，比如导入到 Wasm 模块实例 Import Section 的内容不正确
+- WebAssembly.RuntimeError 表示在 Wasm 模块运行时阶段（Call）发生的错误，比如常见的“除零异常”
+
+错误对象也都有对应的构造函数，可以用来构造对应的错误对象： https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/WebAssembly。  
+
+#### 5.2.4. 模块实例化方法
+
+WebAssembly.instantiate(bufferSource, importObject)  
+
+接受一个包含有效 Wasm 模块二进制字节码的 ArrayBuffer 或 TypedArray 对象，然后返回一个将被解析为 WebAssembly.Module 的 Promise 对象。  
+
+第一个参数对应的 ArrayBuffer 或 TypedArray 类型外，第二个参数为一个 JavaScript 对象，在其中包含有需要被导入到 Wasm 模块实例中的数据，这些数据将通过 Wasm 模块的 “Import Section” 被导入到模块实例中使用。  
+
+方法在调用完成后会返回一个将被解析为 ResultObject 的 Promise 对象。ResultObject 对象包含有两个字段 ，分别是 “module” 以及 “instance”。  
+
+其中 module 表示一个被编译好的 WebAssembly.Module 静态对象；instance 表示一个已经完成实例化的 WebAssembly.Instance 动态对象。所有从 Wasm 模块中导出的方法，都被“挂载”在这个 ResultObject 对象上。  
+
+基于这个方法实现的 Wasm 模块初始化流程如下图所示。你可以看到，整个流程是完全串行的。  
+
+![wasm](images/wasm26.png)
+
+WebAssembly.instantiate 方法还有另外的一个重载形式，也就是其第一个参数类型从含有 Wasm 模块字节码数据的 bufferSource，转变为已经编译好的静态 WebAssembly.Module 对象。这种重载形式通常用于 WebAssembly.Module 对象已经被提前编译好的情况。  
+
+#### 5.2.5. 模块编译方法
+
+WebAssembly.instantiate 方法，主要用于从 Wasm 字节码中一次性进行 Wasm 模块的编译和实例化过程，而这通常是我们经常使用的一种形式。当然你也以将编译和实例化两个步骤分开来进行。比如单独对于编译阶段，你可以使用下面这个 JavaScript API：WebAssembly.compile(bufferSource).  
+
+该方法接收一个含有有效 Wasm 字节码数据的 bufferSource，也就是 ArrayBuffer 或者 TypedArray 对象。返回的 Promise 对象在 Resolve 后，会返回一个编译好的静态 WebAssembly.Module 对象。  
+
+### 5.3. Wasm Web API
+
+Wasm 的 JavaScript API 标准，主要定义了一些与 Wasm 相关的类型和操作，这些类型和操作与具体的平台无关。为了能够在最大程度上利用 Web 平台的一些特性，来加速 Wasm 模块对象的编译和实例化过程，Wasm 标准又通过添加 Wasm Web API 的形式，为 Web 平台上的 Wasm 相关操作提供了新的、高性能的编译和实例化接口。
+
+#### 5.3.1. 模块流式实例化方法
+
+Web API 中定义的“流式接口”可以让我们提前开始对 Wasm 模块进行编译和实例化过程, 可以称此方式为“流式编译”。比如下面这个 API 便对应着 Wasm 模块的“流式实例化”接口：
+
+- WebAssembly.instantiateStreaming(source, importObject)  
+
+为了能够支持“流式编译”，该方法的第一个参数，将不再需要已经从远程加载好的完整 Wasm 模块二进制数据（bufferSource）。取而代之的，是一个尚未 Resolve 的 Response 对象。
+
+Response 对象（window.fetch 调用后的返回结果）是 Fetch API 的重要组成部分，这个对象代表了某个远程 HTTP 请求的响应数据。而该方法中第二个参数所使用的 Response 对象，则必须代表着对某个位于远程位置上的 Wasm 模块文件的请求响应数据。  
+
+通过这种方式，Web 浏览器可以在从远程位置开始加载 Wasm 模块文件数据的同时，也一并启动对 Wasm 模块的编译和初始化工作。相较于上一个 JavaScript API 需要在完全获取 Wasm 模块文件二进制数据后，才能够开始进行编译和实例化流程的方式，流式编译无疑在某种程度上提升了 Web 端运行 Wasm 应用的整体效率。  
+
+基于流式编译进行的 Wasm 模块初始化流程如下图所示。可以看到，与之前 API 有所不同的是，Wasm 模块的编译和初始化可以提前开始，而不用再等待模块的远程加载完全结束。因此应用的整体初始化时间也会有所减少。  
+
+![wasm](images/wasm27.png)
+
+#### 5.3.2. 模块流式编译方法
+
+WebAssembly.compileStreaming(source)  
+
+该 API 的使用方式与 WebAssembly.instantiateStreaming 类似，第一个参数为 Fetch API 中的 Response 对象。API 调用后返回的 Promise 对象在 Resolve 之后，会返回一个编译好的静态 WebAssembly.Module 对象。  
+
+在浏览器加载 Wasm 二进制模块文件的同时，提前开始对模块对象的编译过程。
+
+### 5.4. Wasm 运行时（Runtime）
+
+调用从 Wasm 模块对象中导出的函数。每一个经过实例化的 Wasm 模块对象，都会在运行时维护自己唯一的“调用栈”.  
+
+所有模块导出函数的实际调用过程，都会影响着栈容器中存放的数据，这些数据代表着每条 Wasm 指令的执行结果。当然，这些结果也同样可以被作为导出函数的返回值。  
+
+调用栈一般是“不透明”的。也就是说，我们无法通过任何 API 或者方法直接接触到栈容器中存放的数据。因此，这也是 Wasm 保证执行安全的众多因素之一。  
+
+除了调用栈，每一个实例化的 Wasm 模块对象都有着自己的（在 MVP 下只能有一个）线性内存段。在这个内存段中，以二进制形式存放着 Wasm 模块可以使用的所有数据资源。  
+
+这些资源可以是来自于对 Wasm 模块导出方法调用后的结果，即通过 Wasm 模块内的相关指令对线性内存中的数据进行读写操作；也可以是在进行模块实例化时，我们将预先填充好的二进制数据资源以 WebAssembly.Memory 导入对象的形式，提前导入到模块实例中进行使用。  
+
+浏览器在为 Wasm 模块对象分配线性内存时，会将这部分内存与 JavaScript 现有的内存区域进行隔离，并单独管理。在以往的 JavaScript Memory 中，我们可以存放 JavaScript 中的一些数据类型，这些数据同时也可以被相应的 JavaScript / Web API 直接访问。而当数据不再使用时，它们便会被 JavaScript 引擎的 GC 进行垃圾回收。  
+
+![wasm](images/wasm28.png)
+
+相反，图中绿色部分的 WebAssembly Memory 则有所不同。这部分内存可以被 Wasm 模块内部诸如 “i32.load” 与 “i32.store” 等指令直接使用，而外部浏览器宿主中的 JavaScript / Web API 则无法直接进行访问。不仅如此，分配在这部分内存区域中的数据，受限于 MVP 中尚无 GC 相关的标准，因此需要 Wasm 模块自行进行清理和回收。  
+
+Wasm 的内存访问安全性是众多人关心的一个话题。事实上你并不用担心太多，因为当浏览器在执行 “i32.load” 与 “i32.store” 这些内存访问指令时，会首先检查指令所引用的内存地址偏移，是否超出了 Wasm 模块实例所拥有的内存地址范围。若引用地址不在上图中绿色范围以内，则会终止指令的执行，并抛出相应的异常。这个检查过程我们一般称之为 “Bound Check”。  
+
+### 5.5. Wasm 内存模型
+
+每一个 Wasm 模块实例都有着自己对应的线性内存段。准确来讲，也就是由 “Memory Section” 和 “Data Section” 共同“描述”的一个线性内存区域。在这个区域中，以二进制形式存放着模块所使用到的各种数据资源。  
+
+事实上，每一个 Wasm 实例所能够合法访问的线性内存范围，仅限于我们上面讲到的这一部分内存段。对于宿主环境中的任何变量数据，如果 Wasm 模块实例想要使用，一般可以通过以下两种常见的方式：  
+
+1. 对于简单（字符 \ 数字值等）数据类型，可以选择将其视为全局数据，通过 “Import Section” 导入到模块中使用；
+2. 对于复杂数据，需要将其以“字节”的形式，拷贝到模块实例的线性内存段中来使用。  
+
+在 Web 浏览器这个宿主环境中，一个内存实例通常可以由 JavaScript 中的 ArrayBuffer 类型来进行表示。ArrayBuffer 中存放的是原始二进制数据，因此在需要读写这段数据时，我们必须指定一个“操作视图（View）”。你可以把“操作视图”理解为，在对这些二进制数据进行读写操作时，数据的“解读方式”。  
+
+根据实际需要，一个字符可能会占用 1 个字节到多个字节不等的大小。而这个“占用大小”便是我们之前提到的数据“解读方式”。在 JavaScript 中，我们可以使用 TypedArray 以某个具体类型作为视图，来操作 ArrayBuffer 中的数据。  
+
+![wasm](images/wasm29.png)
+
+当我们拥有了填充好数据的 ArrayBuffer 或 TypedArray 对象时，便可以构造自己的 WebAssembly.Memory 导入对象。然后在 Wasm 模块进行实例化时，将该对象导入到模块中，来作为模块实例的线性内存段进行使用。  
+
+#### 5.5.1. 局限性
+
+MVP 全称为 “Minimum Viable Product”，翻译过来是“最小可用产品”。那既然是“最小可用”，当然也就意味着它还有很多的不足。我给你总结了一下，目前可以观测到的“局限性”主要集中在以下几个方面：
+
+1. **无法直接引用 DOM**
+
+无法直接在 Wasm 二进制模块内引用外部宿主环境中的“不透明”（即数据内部的实际结构和组成方式未知）数据类型，比如 DOM 元素。  
+
+目前通常的一种间接实现方式是使用 JavaScript 函数来封装相应的 DOM 操作逻辑，然后将该函数作为导入对象，导入到模块中，由模块在特定时机再进行间接调用来使用。但相对来说，这种借助 JavaScript 的间接调用方式，在某种程度上还是会产生无法弥补的性能损耗。  
+
+2. **复杂数据类型需要进行编解码**
+
+对于除“数字值”以外的“透明”数据类型（比如字符串、字符），当我们想要将它们传递到 Wasm 模块中进行使用时，需要首先对这些数据进行编码（比如 UTF-8）。然后再将编码后的结果以二进制数据的形式存放到 Wasm 的线性内存段中。模块内部指令在实际使用时，再将这些数据进行解码。  
+
+总结目前 Wasm MVP 标准在 Web 浏览器上的能力：凡是能够使用 Wasm 来实现的功能，现阶段都可以通过 JavaScript 来实现；而能够使用 JavaScript 来实现的功能，其中部分还无法直接通过 Wasm 实现（比如调用 Web API）。  
+
+![wasm](images/wasm30.png)
 
 
 
